@@ -28,15 +28,8 @@ A Discord bot that allows you to control Lovense toys using slash commands.
 Create a .env file in the root directory with your Discord bot token:
 
 DISCORD_TOKEN=your_discord_token_here
+
 UserID=your_user_id_here
-
-Usage:
-
-Once the bot is running, you can use the following slash commands in your Discord server:
-
-Vibrate: Use /vibrate <intensity> <time_sec> to make the Lovense toy vibrate at the specified intensity for the given duration.
-Rotate: Use /rotate <intensity> <time_sec> to rotate the Lovense toy.
-Stop: Use /stop to stop the toy.
 
 Note:
 Ensure that your Lovense toy is connected and accessible via LAN.
