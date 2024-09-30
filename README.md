@@ -32,6 +32,7 @@ DISCORD_TOKEN=your_discord_token_here
 UserID=your_user_id_here
 
 Note:
+
 Ensure that your Lovense toy is connected and accessible via LAN.
 You will need https://www.lovense.com/app/remote
 Once Toy is connected you must go under the Little icon that looks like the toy u connected click it and Enable Allow Control
