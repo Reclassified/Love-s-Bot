@@ -33,7 +33,7 @@ UserID=your_user_id_here
 
 Note:
 
-You will need https://www.lovense.com/app/remote
+You will need https://www.lovense.com/app/remote and https://www.lovense.com/bluetooth-adapter
 
 Once Toy is connected you must go under the Little icon that looks like the toy u connected click it and Enable Allow Control
 
