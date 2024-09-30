@@ -33,15 +33,9 @@ UserID=your_user_id_here
 
 Note:
 Ensure that your Lovense toy is connected and accessible via LAN.
-
 You will need https://www.lovense.com/app/remote
-
 Once Toy is connected you must go under the Little icon that looks like the toy u connected click it and Enable Allow Control
-
 This will start https://api.lovense.com/api/lan/getToys
-
 Which is need for the program to grab all the data automatically
-
 To make the discord bot follow this to make the token https://discordpy.readthedocs.io/en/stable/discord.html
-
 You may need to adjust the toy settings or permissions to allow the bot to control it.
