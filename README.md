@@ -22,8 +22,7 @@ A Discord bot that allows you to control Lovense toys using slash commands.
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/yourusername/lovense-discord-bot.git
-   cd lovense-discord-bot
+   git clone https://github.com/Reclassified/Love-s-Bot.git
 
 Create a .env file in the root directory with your Discord bot token:
 
