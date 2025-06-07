@@ -7,15 +7,17 @@ import logging
 import time
 import random
 import asyncio
+import json
 from dotenv import load_dotenv
 from typing import Optional, Tuple, List, Dict
+from buttplug import Client, WebsocketConnector, ProtocolSpec
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('lovense_bot.log'),
+        logging.FileHandler('buttplug_bot.log'),
         logging.StreamHandler()
     ]
 )
@@ -30,6 +32,7 @@ MAX_INTENSITY = 100
 MIN_INTENSITY = 0
 MAX_TIME_SEC = 3600  # 1 hour
 MIN_TIME_SEC = 1
+BUTTPLUG_WS_URL = "ws://127.0.0.1:12345"  # Default Intiface Central WebSocket URL
 
 # AI Control Constants
 PATTERN_TYPES = {
@@ -51,128 +54,437 @@ def validate_time(time_sec: int) -> bool:
     """Validate the time parameter."""
     return MIN_TIME_SEC <= time_sec <= MAX_TIME_SEC
 
-def get_lovense_toy_info() -> Optional[dict]:
-    """Get information about connected Lovense toys with retry mechanism."""
-    max_retries = 3
-    retry_delay = 2  # seconds
-    
-    for attempt in range(max_retries):
+class ButtplugDevice:
+    def __init__(self, device_id: str, device_name: str, device_type: str, client: Client):
+        self.device_id = device_id
+        self.device_name = device_name
+        self.device_type = device_type
+        self.client = client
+        self.device = None
+        self.current_task = None
+
+    async def connect(self):
+        """Connect to the device through Buttplug."""
         try:
-            response = requests.get("https://api.lovense.com/api/lan/getToys", verify=False)
-            logger.info(f"Fetching toys... Status Code: {response.status_code}")
-            
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(f"Error fetching toys: {response.status_code} - {response.text}")
-                if attempt < max_retries - 1:
-                    logger.info(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                    continue
-                return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Network error while fetching toys: {e}")
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-                continue
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error while fetching toys: {e}")
-            return None
-
-def parse_toy_info(toy_info: Optional[dict]) -> Tuple[List[str], Optional[str], Optional[int]]:
-    """Parse toy information and return toy IDs, domain, and port."""
-    if not toy_info:
-        return [], None, None
-        
-    try:
-        toy_ids = []
-        domain = None
-        https_port = None
-        
-        for domain_key, domain_info in toy_info.items():
-            domain = domain_info.get("domain")
-            https_port = domain_info.get("httpsPort")
-            for toy_id, toy_details in domain_info["toys"].items():
-                toy_ids.append(toy_id)
-                logger.info(f"Found toy: {toy_details.get('toyType', 'Unknown')} ({toy_id})")
-                
-        return toy_ids, domain, https_port
-    except Exception as e:
-        logger.error(f"Error parsing toy info: {e}")
-        return [], None, None
-
-def send_lovense_command(domain: str, https_port: int, action: str, intensity: int = 0, time_sec: int = 0) -> bool:
-    """Send command to Lovense toy with error handling."""
-    try:
-        params = {
-            "command": "Function",
-            "action": f"{action}:{intensity}",
-            "timeSec": time_sec,
-            "loopRunningSec": 1,
-            "loopPauseSec": 1,
-            "apiVer": 1,
-            "stopPrevious": 1
-        }
-        url = f"https://{domain}:{https_port}/command"
-        logger.info(f"Sending command to {url}: {params}")
-        
-        response = requests.post(url, json=params, verify=False)
-        if response.status_code == 200:
-            logger.info(f"Command sent successfully: {response.json()}")
-            return True
-        else:
-            logger.error(f"Error sending command: {response.status_code} - {response.text}")
+            # Find the device in the client's device list
+            for device in self.client.devices.values():
+                if device.name == self.device_name:
+                    self.device = device
+                    logger.info(f"Connected to device: {self.device_name}")
+                    return True
+            logger.error(f"Device {self.device_name} not found in client devices")
             return False
+        except Exception as e:
+            logger.error(f"Error connecting to device {self.device_name}: {e}")
+            return False
+
+    async def send_command(self, action: str, intensity: float = 0.0, time_sec: int = 0):
+        """Send command to the device through Buttplug."""
+        if not self.device:
+            logger.error(f"Device {self.device_name} is not connected")
+            return False
+
+        try:
+            # Cancel any existing command
+            if self.current_task and not self.current_task.done():
+                self.current_task.cancel()
+                try:
+                    await self.current_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Convert intensity to 0-1 range
+            normalized_intensity = intensity / 100.0
+
+            if action == "Vibrate":
+                # Use scalar actuators for vibration
+                if len(self.device.actuators) > 0:
+                    await self.device.actuators[0].command(normalized_intensity)
+                else:
+                    logger.error(f"No actuators found on device {self.device_name}")
+                    return False
+            elif action == "Rotate":
+                # Use rotatory actuators for rotation
+                if len(self.device.rotatory_actuators) > 0:
+                    await self.device.rotatory_actuators[0].command(normalized_intensity, True)
+                else:
+                    logger.error(f"No rotatory actuators found on device {self.device_name}")
+                    return False
+            elif action == "Linear":
+                # Use linear actuators for linear movement
+                if len(self.device.linear_actuators) > 0:
+                    await self.device.linear_actuators[0].command(time_sec * 1000, normalized_intensity)
+                else:
+                    logger.error(f"No linear actuators found on device {self.device_name}")
+                    return False
+            elif action == "Stop":
+                # Stop all actuators
+                if len(self.device.actuators) > 0:
+                    await self.device.actuators[0].command(0.0)
+                if len(self.device.rotatory_actuators) > 0:
+                    await self.device.rotatory_actuators[0].command(0.0, True)
+                if len(self.device.linear_actuators) > 0:
+                    await self.device.linear_actuators[0].command(0, 0.0)
+                return True
+            else:
+                logger.error(f"Unknown action: {action}")
+                return False
+
+            logger.info(f"Command sent successfully to {self.device_name}")
+
+            # If a duration is specified, create a task to stop the device after that duration
+            if time_sec > 0 and action != "Linear":  # Linear commands handle duration internally
+                async def stop_after_duration():
+                    try:
+                        await asyncio.sleep(time_sec)
+                        # Stop all actuators
+                        if len(self.device.actuators) > 0:
+                            await self.device.actuators[0].command(0.0)
+                        if len(self.device.rotatory_actuators) > 0:
+                            await self.device.rotatory_actuators[0].command(0.0, True)
+                        if len(self.device.linear_actuators) > 0:
+                            await self.device.linear_actuators[0].command(0, 0.0)
+                        logger.info(f"Stopped device {self.device_name} after {time_sec} seconds")
+                    except asyncio.CancelledError:
+                        logger.info(f"Duration task cancelled for device {self.device_name}")
+                    except Exception as e:
+                        logger.error(f"Error in duration task for device {self.device_name}: {e}")
+
+                self.current_task = asyncio.create_task(stop_after_duration())
+
+            return True
+        except Exception as e:
+            logger.error(f"Error sending command to {self.device_name}: {e}")
+            return False
+
+    async def stop(self):
+        """Stop the device and cancel any pending duration tasks."""
+        if self.current_task and not self.current_task.done():
+            self.current_task.cancel()
+            try:
+                await self.current_task
+            except asyncio.CancelledError:
+                pass
+        await self.send_command("Stop", 0, 0)
+
+class CommandQueue:
+    def __init__(self):
+        self.queues = {}  # device_id -> asyncio.Queue
+        self.running = {}  # device_id -> bool
+        self.locks = {}    # device_id -> asyncio.Lock
+
+    def get_queue(self, device_id: str) -> asyncio.Queue:
+        """Get or create a queue for a device."""
+        if device_id not in self.queues:
+            self.queues[device_id] = asyncio.Queue()
+            self.running[device_id] = False
+            self.locks[device_id] = asyncio.Lock()
+        return self.queues[device_id]
+
+    async def add_command(self, device_id: str, command: dict) -> bool:
+        """Add a command to the device's queue."""
+        queue = self.get_queue(device_id)
+        await queue.put(command)
+        return True
+
+    async def process_queue(self, device_id: str, device: ButtplugDevice):
+        """Process commands in the device's queue."""
+        queue = self.get_queue(device_id)
+        
+        while True:
+            try:
+                # Get the next command
+                command = await queue.get()
+                
+                async with self.locks[device_id]:
+                    self.running[device_id] = True
+                    try:
+                        # Execute the command
+                        success = await device.send_command(
+                            command['action'],
+                            command['intensity'],
+                            command['time_sec']
+                        )
+                        
+                        # Notify the user of the result
+                        if command.get('interaction'):
+                            if success:
+                                await command['interaction'].followup.send(
+                                    f"✅ Command executed: {command['action']} at {command['intensity']}% for {command['time_sec']}s"
+                                )
+                            else:
+                                await command['interaction'].followup.send(
+                                    f"❌ Failed to execute command: {command['action']}"
+                                )
+
+                        # Wait for the command duration before processing next command
+                        if success and command['time_sec'] > 0 and command['action'] != 'Stop':
+                            await asyncio.sleep(command['time_sec'])
+                            # Ensure device is stopped after duration
+                            await device.send_command('Stop', 0, 0)
+                            
+                    finally:
+                        self.running[device_id] = False
+                        queue.task_done()
+                        
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error processing command for device {device_id}: {e}")
+                if command.get('interaction'):
+                    await command['interaction'].followup.send(f"❌ Error executing command: {str(e)}")
+
+    def is_device_busy(self, device_id: str) -> bool:
+        """Check if a device is currently processing commands."""
+        return self.running.get(device_id, False)
+
+    def get_queue_size(self, device_id: str) -> int:
+        """Get the number of commands waiting in the queue."""
+        return self.queues.get(device_id, asyncio.Queue()).qsize()
+
+    async def clear_queue(self, device_id: str):
+        """Clear all pending commands for a device."""
+        queue = self.get_queue(device_id)
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+                queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+# Create global command queue
+command_queue = CommandQueue()
+
+class DeviceManager:
+    def __init__(self):
+        self.devices: Dict[str, ButtplugDevice] = {}
+        self.client = None
+        self.is_connected = False
+        self.connection_check_task = None
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 5
+        self.reconnect_delay = 5  # seconds
+        self.queue_tasks = {}  # device_id -> task
+
+    async def connect_to_server(self):
+        """Connect to Buttplug server."""
+        try:
+            connector = WebsocketConnector(BUTTPLUG_WS_URL, logger=logger)
+            self.client = Client("Discord Bot", ProtocolSpec.v3)
+            await self.client.connect(connector)
+            self.is_connected = True
+            self.reconnect_attempts = 0
+            logger.info("Connected to Buttplug server")
+            return True
+        except Exception as e:
+            logger.error(f"Error connecting to Buttplug server: {e}")
+            self.is_connected = False
+            return False
+
+    async def check_connection(self):
+        """Check connection status and attempt reconnection if needed."""
+        while True:
+            try:
+                if not self.is_connected or not self.client:
+                    logger.warning("Connection lost to Buttplug server. Attempting to reconnect...")
+                    if await self.connect_to_server():
+                        await self.update_devices()
+                        logger.info("Successfully reconnected to Buttplug server")
+                    else:
+                        self.reconnect_attempts += 1
+                        if self.reconnect_attempts >= self.max_reconnect_attempts:
+                            logger.error("Max reconnection attempts reached. Please check your connection and restart the bot.")
+                            break
+                        logger.warning(f"Reconnection attempt {self.reconnect_attempts} failed. Retrying in {self.reconnect_delay} seconds...")
+                        await asyncio.sleep(self.reconnect_delay)
+                else:
+                    # Check if devices are still connected
+                    for device_id, device in list(self.devices.items()):
+                        if not device.device or device.device not in self.client.devices.values():
+                            logger.warning(f"Device {device_id} disconnected. Attempting to reconnect...")
+                            if not await device.connect():
+                                logger.error(f"Failed to reconnect device {device_id}")
+                                del self.devices[device_id]
+                            else:
+                                logger.info(f"Successfully reconnected device {device_id}")
+
+                await asyncio.sleep(10)  # Check every 10 seconds
+            except Exception as e:
+                logger.error(f"Error in connection check: {e}")
+                await asyncio.sleep(5)
+
+    async def start_connection_monitoring(self):
+        """Start the connection monitoring task."""
+        if not self.connection_check_task:
+            self.connection_check_task = asyncio.create_task(self.check_connection())
+            logger.info("Started connection monitoring")
+
+    async def stop_connection_monitoring(self):
+        """Stop the connection monitoring task."""
+        if self.connection_check_task:
+            self.connection_check_task.cancel()
+            try:
+                await self.connection_check_task
+            except asyncio.CancelledError:
+                pass
+            self.connection_check_task = None
+            logger.info("Stopped connection monitoring")
+
+    async def start_queue_processing(self, device_id: str, device: ButtplugDevice):
+        """Start processing commands for a device."""
+        if device_id not in self.queue_tasks:
+            self.queue_tasks[device_id] = asyncio.create_task(
+                command_queue.process_queue(device_id, device)
+            )
+
+    async def stop_queue_processing(self, device_id: str):
+        """Stop processing commands for a device."""
+        if device_id in self.queue_tasks:
+            self.queue_tasks[device_id].cancel()
+            try:
+                await self.queue_tasks[device_id]
+            except asyncio.CancelledError:
+                pass
+            del self.queue_tasks[device_id]
+
+    async def update_devices(self):
+        """Update the list of available devices."""
+        if not self.client:
+            return
+
+        try:
+            # Start scanning for devices
+            await self.client.start_scanning()
+            await asyncio.sleep(10)  # Wait longer for devices to be discovered
+            await self.client.stop_scanning()
+
+            # Update device list
+            for device in self.client.devices.values():
+                device_id = str(device.index)
+                if device_id not in self.devices:
+                    # Get device type based on available actuators
+                    device_type = "Unknown"
+                    if len(device.actuators) > 0:
+                        device_type = "Vibrator"
+                    if len(device.rotatory_actuators) > 0:
+                        device_type = "Rotator"
+                    if len(device.linear_actuators) > 0:
+                        device_type = "Linear"
+
+                    self.devices[device_id] = ButtplugDevice(
+                        device_id=device_id,
+                        device_name=device.name,
+                        device_type=device_type,
+                        client=self.client
+                    )
+                    await self.devices[device_id].connect()
+                    # Start queue processing for the new device
+                    await self.start_queue_processing(device_id, self.devices[device_id])
+                    logger.info(f"Added new device: {device.name} ({device_id}) of type {device_type}")
+        except Exception as e:
+            logger.error(f"Error updating devices: {e}")
+
+    def get_device(self, device_id: str) -> Optional[ButtplugDevice]:
+        """Get a specific device by ID."""
+        return self.devices.get(device_id)
+
+    def get_all_devices(self) -> List[ButtplugDevice]:
+        """Get all available devices."""
+        return list(self.devices.values())
+
+    def get_devices_by_type(self, device_type: str) -> List[ButtplugDevice]:
+        """Get all devices of a specific type."""
+        return [device for device in self.devices.values() 
+                if device.device_type.lower() == device_type.lower()]
+
+# Global device manager instance
+device_manager = DeviceManager()
+
+@client.tree.command(name="sync", description="Sync bot commands with Discord (Admin only)")
+async def sync(interaction: discord.Interaction):
+    """Sync bot commands with Discord."""
+    # Check if user is the bot owner
+    if str(interaction.user.id) != os.getenv('UserID'):
+        await interaction.response.send_message("❌ This command is only available to the bot owner.", ephemeral=True)
+        return
+
+    try:
+        await interaction.response.send_message("🔄 Syncing commands...", ephemeral=True)
+        await client.tree.sync()
+        await interaction.followup.send("✅ Commands synced successfully!", ephemeral=True)
     except Exception as e:
-        logger.error(f"Error sending command: {e}")
-        return False
+        logger.error(f"Error syncing commands: {e}")
+        await interaction.followup.send(f"❌ Error syncing commands: {str(e)}", ephemeral=True)
 
 @client.event
 async def on_ready():
     print(f'Logged in as {client.user}')
     try:
         # Sync commands with Discord
+        print("Syncing commands with Discord...")
         await client.tree.sync()
         print("Commands synced with Discord!")
         
-        await client.change_presence(activity=discord.Game(" with your lovense"))
-        toy_info = get_lovense_toy_info()
-        toy_manager.update_toys(toy_info)
+        await client.change_presence(activity=discord.Game(" with your toys"))
+        
+        # Connect to Buttplug server and start monitoring
+        if await device_manager.connect_to_server():
+            await device_manager.update_devices()
+            await device_manager.start_connection_monitoring()
+            
+            # Create a message with device types and IDs
+            message = "Connected! Found devices: "
+            if device_manager.devices:
+                device_details_list = []
+                for device in device_manager.get_all_devices():
+                    device_details_list.append(f"{device.device_name} ({device.device_id})")
+                message += ", ".join(device_details_list)
+            else:
+                message += "No devices found."
 
-        # Create a message with toy types and IDs
-        message = "Connected! Found Lovense toys: "
-        if toy_manager.toys:
-            toy_details_list = []
-            for toy in toy_manager.get_all_toys():
-                toy_details_list.append(f"{toy.toy_type} ({toy.toy_id})")
-            message += ", ".join(toy_details_list)
-        else:
-            message += "No Lovense toys found."
-
-        user = await client.fetch_user(os.getenv('UserID'))
-        await user.send(message)
+            user = await client.fetch_user(os.getenv('UserID'))
+            await user.send(message)
     except Exception as e:
-        print(f"Error checking Lovense toys: {e}")
+        print(f"Error checking devices: {e}")
+
+@client.event
+async def on_disconnect():
+    """Handle Discord disconnection."""
+    logger.warning("Discord connection lost. Attempting to reconnect...")
+    await device_manager.stop_connection_monitoring()
+
+@client.event
+async def on_resumed():
+    """Handle Discord reconnection."""
+    logger.info("Discord connection resumed")
+    await device_manager.start_connection_monitoring()
 
 @client.tree.command(name="help", description="Show all available commands and their usage")
 async def help_command(interaction: discord.Interaction):
     """Show all available commands and their usage."""
     commands_info = {
+        "Admin Commands": {
+            "sync": "Sync bot commands with Discord (Admin only)\nUsage: `/sync`",
+        },
+        "Device Management": {
+            "list_devices": "List all connected devices and their capabilities\nUsage: `/list_devices`",
+            "rescan": "Manually scan for and reconnect toys\nUsage: `/rescan`",
+            "connection_status": "Check connection status of bot and toys\nUsage: `/connection_status`",
+        },
         "Basic Commands": {
-            "vibrate": "Vibrate the Lovense toy\nUsage: `/vibrate intensity time_sec`\nExample: `/vibrate 50 30`",
-            "rotate": "Rotate the Lovense toy\nUsage: `/rotate intensity time_sec`\nExample: `/rotate 50 30`",
-            "stop": "Stop the Lovense toy\nUsage: `/stop`"
+            "vibrate": "Vibrate the device\nUsage: `/vibrate device_id intensity time_sec`\nExample: `/vibrate 0 50 30`",
+            "rotate": "Rotate the device\nUsage: `/rotate device_id intensity time_sec`\nExample: `/rotate 0 50 30`",
+            "linear": "Control linear actuator\nUsage: `/linear device_id position time_sec`\nExample: `/linear 0 50 30`",
+            "stop": "Stop the device\nUsage: `/stop device_id`"
         },
         "AI Control Commands": {
-            "ai_control": "Start AI-controlled pattern\nUsage: `/ai_control pattern duration`\nPatterns: wave, pulse, escalate, random\nExample: `/ai_control wave 30`",
-            "stop_ai": "Stop the current AI pattern\nUsage: `/stop_ai`"
+            "ai_control": "Start AI-controlled pattern\nUsage: `/ai_control device_id pattern duration`\nPatterns: wave, pulse, escalate, random\nExample: `/ai_control 0 wave 30`",
+            "stop_ai": "Stop the current AI pattern\nUsage: `/stop_ai device_id`"
         }
     }
 
     embed = discord.Embed(
-        title="Lovense Bot Commands",
+        title="Buttplug Bot Commands",
         description="Here are all available commands:",
         color=discord.Color.blue()
     )
@@ -208,9 +520,9 @@ async def list_patterns(interaction: discord.Interaction):
 
     await interaction.response.send_message(embed=embed)
 
-@client.tree.command(name="vibrate", description="Vibrate the Lovense toy")
-async def vibrate(interaction: discord.Interaction, toy_id: str, intensity: int, time_sec: int):
-    """Vibrate a specific Lovense toy."""
+@client.tree.command(name="vibrate", description="Vibrate a device")
+async def vibrate(interaction: discord.Interaction, device_id: str, intensity: int, time_sec: int):
+    """Vibrate a specific device."""
     if not validate_intensity(intensity):
         await interaction.response.send_message(f"Error: Intensity must be between {MIN_INTENSITY} and {MAX_INTENSITY}.")
         return
@@ -219,19 +531,30 @@ async def vibrate(interaction: discord.Interaction, toy_id: str, intensity: int,
         await interaction.response.send_message(f"Error: Time must be between {MIN_TIME_SEC} and {MAX_TIME_SEC} seconds.")
         return
 
-    toy = toy_manager.get_toy(toy_id)
-    if not toy:
-        await interaction.response.send_message(f"Error: Toy with ID {toy_id} not found.")
+    device = device_manager.get_device(device_id)
+    if not device:
+        await interaction.response.send_message(f"Error: Device with ID {device_id} not found.")
         return
 
-    success = toy.send_command("Vibrate", intensity, time_sec)
-    if success:
-        await interaction.response.send_message(f"Vibration command sent to toy {toy_id} at intensity {intensity} for {time_sec} seconds.")
+    # Check if device is busy
+    if command_queue.is_device_busy(device_id):
+        queue_size = command_queue.get_queue_size(device_id)
+        await interaction.response.send_message(
+            f"⏳ Device is busy. Your command has been queued. Position in queue: {queue_size + 1}"
+        )
     else:
-        await interaction.response.send_message(f"Error: Failed to send vibration command to toy {toy_id}.")
+        await interaction.response.send_message("⏳ Processing your command...")
 
-@client.tree.command(name="rotate", description="Rotate the Lovense toy")
-async def rotate(interaction: discord.Interaction, intensity: int, time_sec: int):
+    # Add command to queue
+    await command_queue.add_command(device_id, {
+        'action': 'Vibrate',
+        'intensity': intensity,
+        'time_sec': time_sec,
+        'interaction': interaction
+    })
+
+@client.tree.command(name="rotate", description="Rotate the device")
+async def rotate(interaction: discord.Interaction, device_id: str, intensity: int, time_sec: int):
     """Rotate command with input validation."""
     if not validate_intensity(intensity):
         await interaction.response.send_message(f"Error: Intensity must be between {MIN_INTENSITY} and {MAX_INTENSITY}.")
@@ -240,35 +563,46 @@ async def rotate(interaction: discord.Interaction, intensity: int, time_sec: int
     if not validate_time(time_sec):
         await interaction.response.send_message(f"Error: Time must be between {MIN_TIME_SEC} and {MAX_TIME_SEC} seconds.")
         return
-        
-    action = "Rotate"
-    toy_info = get_lovense_toy_info()
-    toy_ids, domain, https_port = parse_toy_info(toy_info)
-    
-    if domain and https_port:
-        success = send_lovense_command(domain, https_port, action, intensity, time_sec)
-        if success:
-            await interaction.response.send_message(f"Rotation command sent at intensity {intensity} for {time_sec} seconds.")
-        else:
-            await interaction.response.send_message("Error: Failed to send rotation command.")
-    else:
-        await interaction.response.send_message("Error: No Lovense toys found.")
 
-@client.tree.command(name="stop", description="Stop the Lovense toy")
-async def stop(interaction: discord.Interaction):
-    action = "Stop"
-    toy_info = get_lovense_toy_info()
-    toy_ids, domain, https_port = parse_toy_info(toy_info)
-    if domain and https_port:
-        send_lovense_command(domain, https_port, action, 0, 0)
-        await interaction.response.send_message("Stop command sent.")
+    device = device_manager.get_device(device_id)
+    if not device:
+        await interaction.response.send_message(f"Error: Device with ID {device_id} not found.")
+        return
+
+    # Check if device is busy
+    if command_queue.is_device_busy(device_id):
+        queue_size = command_queue.get_queue_size(device_id)
+        await interaction.response.send_message(
+            f"⏳ Device is busy. Your command has been queued. Position in queue: {queue_size + 1}"
+        )
     else:
-        await interaction.response.send_message("Error: No Lovense toys found.")
+        await interaction.response.send_message("⏳ Processing your command...")
+
+    # Add command to queue
+    await command_queue.add_command(device_id, {
+        'action': 'Rotate',
+        'intensity': intensity,
+        'time_sec': time_sec,
+        'interaction': interaction
+    })
+
+@client.tree.command(name="stop", description="Stop the device and clear its command queue")
+async def stop(interaction: discord.Interaction, device_id: str):
+    device = device_manager.get_device(device_id)
+    if not device:
+        await interaction.response.send_message(f"Error: Device with ID {device_id} not found.")
+        return
+
+    # Stop current command and clear queue
+    await device.send_command("Stop", 0, 0)
+    await command_queue.clear_queue(device_id)
+    
+    await interaction.response.send_message(f"✅ Device stopped and command queue cleared.")
 
 class AIController:
-    def __init__(self, domain: str, https_port: int):
-        self.domain = domain
-        self.https_port = https_port
+    def __init__(self, device_id: str, device_type: str):
+        self.device_id = device_id
+        self.device_type = device_type
         self.is_running = False
         self.current_pattern = None
         self.current_task = None
@@ -304,13 +638,7 @@ class AIController:
                 if total_time >= duration:
                     break
 
-                success = send_lovense_command(
-                    self.domain,
-                    self.https_port,
-                    "Vibrate",
-                    intensity,
-                    step_duration
-                )
+                success = await self.send_command(intensity, step_duration)
                 
                 if not success:
                     logger.error(f"Failed to execute pattern step: {intensity} for {step_duration}s")
@@ -324,24 +652,41 @@ class AIController:
             return False
         finally:
             self.is_running = False
-            # Ensure toy is stopped
-            send_lovense_command(self.domain, self.https_port, "Stop", 0, 0)
+            # Ensure device is stopped
+            await self.send_command(0, 0)
 
         return True
+
+    async def send_command(self, intensity: float, time_sec: int):
+        """Send command to the device through Buttplug."""
+        device = device_manager.get_device(self.device_id)
+        if not device:
+            logger.error(f"Device with ID {self.device_id} not found")
+            return False
+
+        try:
+            success = await device.send_command("Vibrate", intensity, time_sec)
+            if success:
+                logger.info(f"Command sent successfully to device {self.device_id}")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Error sending command to device {self.device_id}: {e}")
+            return False
 
     def stop(self):
         """Stop the current pattern."""
         self.is_running = False
         if self.current_task:
             self.current_task.cancel()
-        send_lovense_command(self.domain, self.https_port, "Stop", 0, 0)
+        device_manager.get_device(self.device_id).send_command("Stop", 0, 0)
 
 # Global AI controller instance
 ai_controller = None
 
 @client.tree.command(name="ai_control", description="Start AI-controlled pattern")
-async def ai_control(interaction: discord.Interaction, pattern: str, duration: int = 30):
-    """Start AI-controlled pattern for the Lovense toy."""
+async def ai_control(interaction: discord.Interaction, device_id: str, pattern: str, duration: int = 30):
+    """Start AI-controlled pattern for the device."""
     global ai_controller
     
     if pattern not in PATTERN_TYPES:
@@ -356,16 +701,14 @@ async def ai_control(interaction: discord.Interaction, pattern: str, duration: i
         )
         return
 
-    toy_info = get_lovense_toy_info()
-    toy_ids, domain, https_port = parse_toy_info(toy_info)
-
-    if not domain or not https_port:
-        await interaction.response.send_message("Error: No Lovense toys found.")
+    device = device_manager.get_device(device_id)
+    if not device:
+        await interaction.response.send_message(f"Error: Device with ID {device_id} not found.")
         return
 
     # Initialize AI controller if not exists
     if not ai_controller:
-        ai_controller = AIController(domain, https_port)
+        ai_controller = AIController(device_id, device.device_type)
     elif ai_controller.is_running:
         await interaction.response.send_message("Error: AI control is already running.")
         return
@@ -381,7 +724,7 @@ async def ai_control(interaction: discord.Interaction, pattern: str, duration: i
         await interaction.followup.send("Error: AI control failed.")
 
 @client.tree.command(name="stop_ai", description="Stop AI-controlled pattern")
-async def stop_ai(interaction: discord.Interaction):
+async def stop_ai(interaction: discord.Interaction, device_id: str):
     """Stop the current AI-controlled pattern."""
     global ai_controller
     
@@ -392,157 +735,201 @@ async def stop_ai(interaction: discord.Interaction):
     ai_controller.stop()
     await interaction.response.send_message("AI control stopped.")
 
-class ToyController:
-    def __init__(self, toy_id: str, toy_type: str, domain: str, https_port: int):
-        self.toy_id = toy_id
-        self.toy_type = toy_type
-        self.domain = domain
-        self.https_port = https_port
-        self.is_running = False
+@client.tree.command(name="linear", description="Control linear actuator")
+async def linear(interaction: discord.Interaction, device_id: str, position: int, time_sec: int):
+    """Control linear actuator with position and duration."""
+    if not validate_intensity(position):
+        await interaction.response.send_message(f"Error: Position must be between {MIN_INTENSITY} and {MAX_INTENSITY}.")
+        return
+        
+    if not validate_time(time_sec):
+        await interaction.response.send_message(f"Error: Time must be between {MIN_TIME_SEC} and {MAX_TIME_SEC} seconds.")
+        return
 
-    def send_command(self, action: str, intensity: int = 0, time_sec: int = 0) -> bool:
-        """Send command to specific toy."""
-        try:
-            params = {
-                "command": "Function",
-                "action": f"{action}:{intensity}",
-                "timeSec": time_sec,
-                "loopRunningSec": 1,
-                "loopPauseSec": 1,
-                "apiVer": 1,
-                "stopPrevious": 1,
-                "toyId": self.toy_id
-            }
-            url = f"https://{self.domain}:{self.https_port}/command"
-            logger.info(f"Sending command to toy {self.toy_id}: {params}")
-            
-            response = requests.post(url, json=params, verify=False)
-            if response.status_code == 200:
-                logger.info(f"Command sent successfully to toy {self.toy_id}: {response.json()}")
-                return True
-            else:
-                logger.error(f"Error sending command to toy {self.toy_id}: {response.status_code} - {response.text}")
-                return False
-        except Exception as e:
-            logger.error(f"Error sending command to toy {self.toy_id}: {e}")
-            return False
+    device = device_manager.get_device(device_id)
+    if not device:
+        await interaction.response.send_message(f"Error: Device with ID {device_id} not found.")
+        return
 
-class ToyManager:
-    def __init__(self):
-        self.toys: Dict[str, ToyController] = {}
-        self.ai_controllers: Dict[str, AIController] = {}
+    success = await device.send_command("Linear", position, time_sec)
+    if success:
+        await interaction.response.send_message(f"Linear command sent to device {device_id} at position {position} for {time_sec} seconds.")
+    else:
+        await interaction.response.send_message(f"Error: Failed to send linear command to device {device_id}.")
 
-    def update_toys(self, toy_info: dict) -> None:
-        """Update the list of available toys."""
-        if not toy_info:
-            return
-
-        for domain_key, domain_info in toy_info.items():
-            domain = domain_info.get("domain")
-            https_port = domain_info.get("httpsPort")
-            
-            for toy_id, toy_details in domain_info["toys"].items():
-                toy_type = toy_details.get("toyType", "Unknown")
-                if toy_id not in self.toys:
-                    self.toys[toy_id] = ToyController(toy_id, toy_type, domain, https_port)
-                    logger.info(f"Added new toy: {toy_type} ({toy_id})")
-
-    def get_toy(self, toy_id: str) -> Optional[ToyController]:
-        """Get a specific toy by ID."""
-        return self.toys.get(toy_id)
-
-    def get_all_toys(self) -> List[ToyController]:
-        """Get all available toys."""
-        return list(self.toys.values())
-
-    def get_toys_by_type(self, toy_type: str) -> List[ToyController]:
-        """Get all toys of a specific type."""
-        return [toy for toy in self.toys.values() if toy.toy_type.lower() == toy_type.lower()]
-
-# Global toy manager instance
-toy_manager = ToyManager()
-
-@client.tree.command(name="list_toys", description="List all connected Lovense toys")
-async def list_toys(interaction: discord.Interaction):
-    """List all connected Lovense toys."""
-    toy_info = get_lovense_toy_info()
-    toy_manager.update_toys(toy_info)
-    
-    if not toy_manager.toys:
-        await interaction.response.send_message("No Lovense toys found.")
+@client.tree.command(name="list_devices", description="List all connected devices and their capabilities")
+async def list_devices(interaction: discord.Interaction):
+    """List all connected devices with their IDs and capabilities."""
+    if not device_manager.devices:
+        await interaction.response.send_message("No devices found. Make sure your devices are connected and Intiface Central is running.")
         return
 
     embed = discord.Embed(
-        title="Connected Lovense Toys",
-        description="Here are all connected toys:",
+        title="Connected Devices",
+        description="Here are all connected devices and their capabilities:",
         color=discord.Color.blue()
     )
 
-    # Group toys by type
-    toys_by_type = {}
-    for toy in toy_manager.get_all_toys():
-        if toy.toy_type not in toys_by_type:
-            toys_by_type[toy.toy_type] = []
-        toys_by_type[toy.toy_type].append(toy.toy_id)
+    for device in device_manager.get_all_devices():
+        # Get device capabilities
+        capabilities = []
+        if device.device.actuators:
+            capabilities.append("Vibration")
+        if device.device.rotatory_actuators:
+            capabilities.append("Rotation")
+        if device.device.linear_actuators:
+            capabilities.append("Linear Movement")
 
-    for toy_type, toy_ids in toys_by_type.items():
+        device_info = f"**ID:** {device.device_id}\n"
+        device_info += f"**Type:** {device.device_type}\n"
+        device_info += f"**Capabilities:** {', '.join(capabilities) if capabilities else 'None'}\n"
+        device_info += f"**Name:** {device.device_name}"
+
         embed.add_field(
-            name=toy_type,
-            value="\n".join([f"ID: {toy_id}" for toy_id in toy_ids]),
+            name=f"Device {device.device_id}",
+            value=device_info,
             inline=False
         )
 
     await interaction.response.send_message(embed=embed)
 
-@client.tree.command(name="vibrate_all", description="Vibrate all Lovense toys")
-async def vibrate_all(interaction: discord.Interaction, intensity: int, time_sec: int):
-    """Vibrate all connected Lovense toys."""
-    if not validate_intensity(intensity):
-        await interaction.response.send_message(f"Error: Intensity must be between {MIN_INTENSITY} and {MAX_INTENSITY}.")
-        return
-        
-    if not validate_time(time_sec):
-        await interaction.response.send_message(f"Error: Time must be between {MIN_TIME_SEC} and {MAX_TIME_SEC} seconds.")
-        return
+# Add a new command to check connection status
+@client.tree.command(name="connection_status", description="Check the connection status of the bot and devices")
+async def connection_status(interaction: discord.Interaction):
+    """Check and display the connection status of the bot and devices."""
+    embed = discord.Embed(
+        title="Connection Status",
+        color=discord.Color.blue()
+    )
 
-    toy_info = get_lovense_toy_info()
-    toy_manager.update_toys(toy_info)
+    # Check Discord connection
+    discord_status = "🟢 Connected" if client.is_ws_ratelimited() else "🔴 Disconnected"
+    embed.add_field(name="Discord Connection", value=discord_status, inline=False)
+
+    # Check Buttplug server connection
+    buttplug_status = "🟢 Connected" if device_manager.is_connected else "🔴 Disconnected"
+    embed.add_field(name="Buttplug Server", value=buttplug_status, inline=False)
+
+    # Check device connections
+    if device_manager.devices:
+        device_statuses = []
+        for device in device_manager.get_all_devices():
+            status = "🟢 Connected" if device.device and device.device in device_manager.client.devices.values() else "🔴 Disconnected"
+            device_statuses.append(f"{device.device_name} ({device.device_id}): {status}")
+        embed.add_field(name="Devices", value="\n".join(device_statuses), inline=False)
+    else:
+        embed.add_field(name="Devices", value="No devices connected", inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+@client.tree.command(name="rescan", description="Manually scan for and reconnect toys")
+async def rescan(interaction: discord.Interaction):
+    """Manually scan for and reconnect toys."""
+    await interaction.response.send_message("🔄 Scanning for toys...")
     
-    if not toy_manager.toys:
-        await interaction.response.send_message("No Lovense toys found.")
-        return
-
-    success_count = 0
-    for toy in toy_manager.get_all_toys():
-        if toy.send_command("Vibrate", intensity, time_sec):
-            success_count += 1
-
-    await interaction.response.send_message(f"Vibration command sent to {success_count} out of {len(toy_manager.toys)} toys.")
-
-@client.tree.command(name="vibrate_type", description="Vibrate all toys of a specific type")
-async def vibrate_type(interaction: discord.Interaction, toy_type: str, intensity: int, time_sec: int):
-    """Vibrate all toys of a specific type."""
-    if not validate_intensity(intensity):
-        await interaction.response.send_message(f"Error: Intensity must be between {MIN_INTENSITY} and {MAX_INTENSITY}.")
-        return
+    try:
+        # Start scanning for devices
+        await device_manager.client.start_scanning()
+        await asyncio.sleep(10)  # Wait for devices to be discovered
+        await device_manager.client.stop_scanning()
         
-    if not validate_time(time_sec):
-        await interaction.response.send_message(f"Error: Time must be between {MIN_TIME_SEC} and {MAX_TIME_SEC} seconds.")
+        # Update device list
+        old_devices = set(device_manager.devices.keys())
+        await device_manager.update_devices()
+        new_devices = set(device_manager.devices.keys())
+        
+        # Create status message
+        embed = discord.Embed(
+            title="Toy Scan Results",
+            color=discord.Color.blue()
+        )
+        
+        # Check for new devices
+        added_devices = new_devices - old_devices
+        if added_devices:
+            device_list = []
+            for device_id in added_devices:
+                device = device_manager.get_device(device_id)
+                device_list.append(f"🟢 {device.device_name} (ID: {device_id})")
+            embed.add_field(
+                name="New Toys Found",
+                value="\n".join(device_list),
+                inline=False
+            )
+        
+        # Check for lost devices
+        lost_devices = old_devices - new_devices
+        if lost_devices:
+            device_list = []
+            for device_id in lost_devices:
+                device_list.append(f"🔴 Device {device_id}")
+            embed.add_field(
+                name="Lost Toys",
+                value="\n".join(device_list),
+                inline=False
+            )
+        
+        # Show current devices
+        if device_manager.devices:
+            device_list = []
+            for device in device_manager.get_all_devices():
+                status = "🟢 Connected" if device.device and device.device in device_manager.client.devices.values() else "🔴 Disconnected"
+                device_list.append(f"{status} {device.device_name} (ID: {device.device_id})")
+            embed.add_field(
+                name="Current Toys",
+                value="\n".join(device_list),
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="Current Toys",
+                value="No toys connected",
+                inline=False
+            )
+        
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        logger.error(f"Error during rescan: {e}")
+        await interaction.followup.send(f"❌ Error scanning for toys: {str(e)}")
+
+# Add a command to check queue status
+@client.tree.command(name="queue_status", description="Check the command queue status for a device")
+async def queue_status(interaction: discord.Interaction, device_id: str):
+    """Check the command queue status for a device."""
+    device = device_manager.get_device(device_id)
+    if not device:
+        await interaction.response.send_message(f"Error: Device with ID {device_id} not found.")
         return
 
-    toy_info = get_lovense_toy_info()
-    toy_manager.update_toys(toy_info)
+    embed = discord.Embed(
+        title=f"Queue Status for Device {device_id}",
+        color=discord.Color.blue()
+    )
+
+    is_busy = command_queue.is_device_busy(device_id)
+    queue_size = command_queue.get_queue_size(device_id)
+
+    status = "🟢 Idle" if not is_busy else "🟡 Busy"
+    embed.add_field(name="Status", value=status, inline=False)
+    embed.add_field(name="Commands in Queue", value=str(queue_size), inline=False)
+
+    await interaction.response.send_message(embed=embed)
+
+@client.tree.command(name="clear_queue", description="Clear the command queue for a device")
+async def clear_queue(interaction: discord.Interaction, device_id: str):
+    """Clear the command queue for a device."""
+    device = device_manager.get_device(device_id)
+    if not device:
+        await interaction.response.send_message(f"Error: Device with ID {device_id} not found.")
+        return
+
+    # Stop current command
+    await device.send_command("Stop", 0, 0)
     
-    toys = toy_manager.get_toys_by_type(toy_type)
-    if not toys:
-        await interaction.response.send_message(f"No toys of type {toy_type} found.")
-        return
-
-    success_count = 0
-    for toy in toys:
-        if toy.send_command("Vibrate", intensity, time_sec):
-            success_count += 1
-
-    await interaction.response.send_message(f"Vibration command sent to {success_count} out of {len(toys)} {toy_type} toys.")
+    # Clear the queue
+    await command_queue.clear_queue(device_id)
+    
+    await interaction.response.send_message(f"✅ Command queue cleared for device {device_id}")
 
 client.run(os.getenv('DISCORD_TOKEN'))
