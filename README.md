@@ -1,41 +1,53 @@
-# Lovense Discord Bot 🤖
+# Discord Buttplug Bot
 
-A powerful Discord bot that allows you to control Lovense toys through Discord commands. This bot provides both basic control features and advanced AI-controlled patterns for an enhanced experience.
+A Discord bot that allows users to control their toys through Discord commands, with support for multiple devices, command queuing, and automatic connection management.
 
-## Features ✨
+## Features
 
-- **Basic Toy Control**
-  - Vibrate toys with customizable intensity and duration
-  - Rotate toys with adjustable settings
-  - Control individual toys or all toys simultaneously
-  - Control toys by type (e.g., all vibrators)
+### Device Management
+- Automatic device discovery and connection
+- Support for multiple device types (Vibrators, Rotators, Linear actuators)
+- Real-time connection monitoring and auto-reconnection
+- Device status tracking and reporting
 
-- **AI Control Patterns**
-  - Wave: Gradual intensity changes in a wave pattern
-  - Pulse: Quick alternating high and low intensity
-  - Escalate: Progressive intensity increase
-  - Random: Dynamic random patterns
+### Command System
+- Command queuing to prevent overrides
+- Support for multiple users
+- Queue status monitoring
+- Command duration enforcement
 
-- **Toy Management**
-  - List all connected toys
-  - Get detailed toy information
-  - Support for multiple toy types
-  - Real-time toy status updates
+### Basic Commands
+- `/vibrate` - Control vibration intensity and duration
+- `/rotate` - Control rotation speed and duration
+- `/linear` - Control linear actuator position and duration
+- `/stop` - Stop current command and clear queue
 
-## Prerequisites 📋
+### Device Management Commands
+- `/list_devices` - Show all connected devices and their capabilities
+- `/rescan` - Manually scan for and reconnect toys
+- `/connection_status` - Check connection status of bot and toys
+- `/queue_status` - Check command queue status for a device
+- `/clear_queue` - Clear the command queue for a device
+
+### AI Control Commands
+- `/ai_control` - Start AI-controlled patterns
+- `/stop_ai` - Stop current AI pattern
+- `/list_patterns` - Show available AI patterns
+
+## Prerequisites
 
 - Python 3.7 or higher
+- Windows 10 or higher (for Intiface Central compatibility)
 - Discord Bot Token
-- Lovense Connect App running
-- Lovense toys connected to your device
-- Windows 10 or higher (for Lovense Connect compatibility)
+- Intiface Central running locally
+- Buttplug-compatible toys
 
-## Installation 🚀
+## Installation
 
 1. Clone the repository:
 ```bash
 git clone https://github.com/Reclassified/Love-s-Bot.git
-cd lovense-discord-bot
+cd Love-s-Bot
 ```
 
 2. Install required packages:
@@ -43,114 +55,121 @@ cd lovense-discord-bot
 pip install -r requirements.txt
 ```
 
-Required packages (requirements.txt):
+3. Create a `.env` file with the following variables:
 ```
-discord.py>=2.0.0
-python-dotenv>=0.19.0
-requests>=2.26.0
-urllib3>=1.26.0
-```
-
-3. Create a `.env` file in the project root with the following variables:
-```env
 DISCORD_TOKEN=your_discord_bot_token
 UserID=your_discord_user_id
 ```
 
-4. Set up Discord Bot:
-   - Go to [Discord Developer Portal](https://discord.com/developers/applications)
-   - Create a new application
-   - Go to the "Bot" section and create a bot
-   - Enable "Message Content Intent" under Privileged Gateway Intents
-   - Copy the bot token and add it to your `.env` file
+4. Start Intiface Central and ensure it's running on the default WebSocket URL (ws://127.0.0.1:12345)
 
-5. Set up Lovense Connect:
-   - Download and install [Lovense Connect](https://www.lovense.com/download)
-   - Launch Lovense Connect
-   - Connect your Lovense toys
-   - Ensure the toys are discoverable
-
-## Usage 💡
+## Usage
 
 ### Basic Commands
+```
+/vibrate device_id intensity time_sec
+Example: /vibrate 0 50 30  # Vibrate device 0 at 50% intensity for 30 seconds
 
-- `/vibrate [toy_id] [intensity] [time_sec]` - Vibrate a specific toy
-  - Example: `/vibrate 123456 50 30` - Vibrate toy ID 123456 at 50% intensity for 30 seconds
-- `/rotate [intensity] [time_sec]` - Rotate the toy
-  - Example: `/rotate 75 20` - Rotate at 75% intensity for 20 seconds
-- `/stop` - Stop all toy functions
-- `/list_toys` - Show all connected toys
+/rotate device_id intensity time_sec
+Example: /rotate 0 50 30  # Rotate device 0 at 50% speed for 30 seconds
 
-### AI Control Commands
+/linear device_id position time_sec
+Example: /linear 0 50 30  # Move linear actuator to 50% position over 30 seconds
+```
 
-- `/ai_control [pattern] [duration]` - Start AI-controlled pattern
-  - Patterns: wave, pulse, escalate, random
-  - Duration in seconds
-  - Example: `/ai_control wave 60` - Run wave pattern for 60 seconds
-- `/stop_ai` - Stop current AI pattern
-- `/list_patterns` - Show available AI patterns
+### Device Management
+```
+/list_devices  # Show all connected devices
+/rescan  # Manually scan for toys
+/connection_status  # Check connection status
+/queue_status device_id  # Check queue status
+/clear_queue device_id  # Clear command queue
+```
 
-### Group Control Commands
+### AI Control
+```
+/ai_control device_id pattern duration
+Example: /ai_control 0 wave 30  # Run wave pattern on device 0 for 30 seconds
 
-- `/vibrate_all [intensity] [time_sec]` - Vibrate all connected toys
-  - Example: `/vibrate_all 80 45` - Vibrate all toys at 80% for 45 seconds
-- `/vibrate_type [toy_type] [intensity] [time_sec]` - Vibrate all toys of a specific type
-  - Example: `/vibrate_type vibrator 60 30` - Vibrate all vibrators at 60% for 30 seconds
+Available patterns:
+- wave: Gradually increases and decreases intensity
+- pulse: Alternates between high and low intensity
+- escalate: Gradually increases intensity
+- random: Generates random intensity patterns
+```
 
-## Safety and Limits ⚠️
+## Command Queue System
 
-- Intensity range: 0-100
-- Time range: 1-3600 seconds (1 hour max)
-- All commands require proper Discord permissions
-- Bot will automatically stop patterns if they exceed time limits
-- Maximum of 10 toys can be controlled simultaneously
-- Minimum 1-second delay between commands
+The bot implements a command queue system to prevent command overrides and ensure proper execution:
 
-## Troubleshooting 🔧
+1. Each device has its own command queue
+2. Commands are processed in order (FIFO)
+3. Each command runs for its full duration
+4. Next command starts only after current command completes
+5. Stop commands bypass the queue for immediate response
 
-### Common Issues
+### Queue Status
+- Use `/queue_status` to check:
+  - Current device status (Idle/Busy)
+  - Number of commands in queue
+  - Position of your command in queue
 
-1. **Bot not responding to commands**
-   - Check if the bot is online in Discord
-   - Verify the bot has proper permissions in the server
-   - Ensure the bot token in `.env` is correct
+### Queue Management
+- `/stop` - Stops current command and clears queue
+- `/clear_queue` - Clears all pending commands
 
-2. **Toys not connecting**
-   - Ensure Lovense Connect is running
-   - Check if toys are powered on and in range
-   - Verify toys are properly paired with Lovense Connect
-   - Restart Lovense Connect if issues persist
+## Connection Management
 
-3. **Commands not working**
-   - Check if the toy ID is correct
-   - Verify the intensity and time values are within limits
-   - Ensure you have the latest version of the bot
+The bot includes automatic connection management:
 
-4. **Connection errors**
-   - Check your internet connection
-   - Verify Lovense Connect is running
-   - Restart the bot if connection issues persist
+1. Monitors connections to:
+   - Discord
+   - Intiface Central
+   - Individual devices
 
-## Contributing 🤝
+2. Automatic reconnection for:
+   - Lost Discord connection
+   - Lost Intiface Central connection
+   - Disconnected devices
 
-Contributions are welcome! Please feel free to submit a Pull Request. Before contributing:
+3. Connection status monitoring:
+   - Real-time status updates
+   - Automatic reconnection attempts
+   - Detailed error logging
 
-1. Fork the repository
-2. Create a new branch for your feature
-3. Make your changes
-4. Submit a pull request
+## Safety Features
 
-## License 📄
+- Intensity limits (0-100%)
+- Time limits (1-3600 seconds)
+- Command validation
+- Automatic device stopping
+- Queue management for safe operation
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+## Troubleshooting
 
-## Disclaimer ⚠️
+1. **Device Not Found**
+   - Ensure Intiface Central is running
+   - Use `/rescan` to manually scan for devices
+   - Check device is in pairing mode
 
-This bot is for educational and personal use only. Please use responsibly and in accordance with Discord's Terms of Service and Lovense's usage guidelines.
+2. **Connection Issues**
+   - Check Intiface Central is running
+   - Verify WebSocket URL (ws://127.0.0.1:12345)
+   - Use `/connection_status` to check status
 
-## Support 💬
+3. **Command Not Working**
+   - Check device is connected
+   - Verify command parameters
+   - Check queue status with `/queue_status`
 
-If you need help or have questions:
-- Open an issue on GitHub
-- Check the [Discord Support Server](https://discord.gg/your-support-server)
-- Review the troubleshooting section above 
+## Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+## Disclaimer
+
+This bot is intended for adult use only. Users are responsible for using this bot safely and responsibly. 
