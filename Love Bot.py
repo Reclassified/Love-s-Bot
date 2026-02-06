@@ -1,13 +1,9 @@
 import discord
 from discord.ext import commands
-import requests
-import urllib3
 import os
 import logging
-import time
 import random
 import asyncio
-import json
 from dotenv import load_dotenv
 from typing import Optional, Tuple, List, Dict
 from buttplug import Client, WebsocketConnector, ProtocolSpec
@@ -25,8 +21,6 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
 load_dotenv()
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-
 # Constants
 MAX_INTENSITY = 100
 MIN_INTENSITY = 0
@@ -220,8 +214,6 @@ class CommandQueue:
                         # Wait for the command duration before processing next command
                         if success and command['time_sec'] > 0 and command['action'] != 'Stop':
                             await asyncio.sleep(command['time_sec'])
-                            # Ensure device is stopped after duration
-                            await device.send_command('Stop', 0, 0)
                             
                     finally:
                         self.running[device_id] = False
@@ -299,8 +291,9 @@ class DeviceManager:
                         await asyncio.sleep(self.reconnect_delay)
                 else:
                     # Check if devices are still connected
+                    connected_ids = {str(d.index) for d in self.client.devices.values()}
                     for device_id, device in list(self.devices.items()):
-                        if not device.device or device.device not in self.client.devices.values():
+                        if not device.device or device_id not in connected_ids:
                             logger.warning(f"Device {device_id} disconnected. Attempting to reconnect...")
                             if not await device.connect():
                                 logger.error(f"Failed to reconnect device {device_id}")
@@ -674,21 +667,21 @@ class AIController:
             logger.error(f"Error sending command to device {self.device_id}: {e}")
             return False
 
-    def stop(self):
+    async def stop(self):
         """Stop the current pattern."""
         self.is_running = False
         if self.current_task:
             self.current_task.cancel()
-        device_manager.get_device(self.device_id).send_command("Stop", 0, 0)
+        device = device_manager.get_device(self.device_id)
+        if device:
+            await device.send_command("Stop", 0, 0)
 
-# Global AI controller instance
-ai_controller = None
+# Per-device AI controller instances
+ai_controllers: Dict[str, AIController] = {}
 
 @client.tree.command(name="ai_control", description="Start AI-controlled pattern")
 async def ai_control(interaction: discord.Interaction, device_id: str, pattern: str, duration: int = 30):
     """Start AI-controlled pattern for the device."""
-    global ai_controller
-    
     if pattern not in PATTERN_TYPES:
         await interaction.response.send_message(
             f"Error: Invalid pattern. Available patterns: {', '.join(PATTERN_TYPES.keys())}"
@@ -706,33 +699,34 @@ async def ai_control(interaction: discord.Interaction, device_id: str, pattern: 
         await interaction.response.send_message(f"Error: Device with ID {device_id} not found.")
         return
 
-    # Initialize AI controller if not exists
-    if not ai_controller:
-        ai_controller = AIController(device_id, device.device_type)
-    elif ai_controller.is_running:
-        await interaction.response.send_message("Error: AI control is already running.")
+    # Check if this device already has a running pattern
+    if device_id in ai_controllers and ai_controllers[device_id].is_running:
+        await interaction.response.send_message("Error: AI control is already running on this device. Use /stop_ai first.")
         return
 
+    controller = AIController(device_id, device.device_type)
+    ai_controllers[device_id] = controller
+
     await interaction.response.send_message(f"Starting AI control with {pattern} pattern for {duration} seconds...")
-    
-    # Run the pattern
-    success = await ai_controller.run_pattern(pattern, duration)
-    
-    if success:
-        await interaction.followup.send("AI control completed successfully.")
-    else:
-        await interaction.followup.send("Error: AI control failed.")
+
+    # Run the pattern as a background task so it doesn't block the interaction
+    async def run_and_notify():
+        success = await controller.run_pattern(pattern, duration)
+        if success:
+            await interaction.followup.send("AI control completed successfully.")
+        else:
+            await interaction.followup.send("Error: AI control failed.")
+
+    controller.current_task = asyncio.create_task(run_and_notify())
 
 @client.tree.command(name="stop_ai", description="Stop AI-controlled pattern")
 async def stop_ai(interaction: discord.Interaction, device_id: str):
     """Stop the current AI-controlled pattern."""
-    global ai_controller
-    
-    if not ai_controller or not ai_controller.is_running:
-        await interaction.response.send_message("Error: No AI control is currently running.")
+    if device_id not in ai_controllers or not ai_controllers[device_id].is_running:
+        await interaction.response.send_message("Error: No AI control is currently running on this device.")
         return
 
-    ai_controller.stop()
+    await ai_controllers[device_id].stop()
     await interaction.response.send_message("AI control stopped.")
 
 @client.tree.command(name="linear", description="Control linear actuator")
@@ -803,7 +797,7 @@ async def connection_status(interaction: discord.Interaction):
     )
 
     # Check Discord connection
-    discord_status = "🟢 Connected" if client.is_ws_ratelimited() else "🔴 Disconnected"
+    discord_status = "🟢 Connected" if client.is_ready() else "🔴 Disconnected"
     embed.add_field(name="Discord Connection", value=discord_status, inline=False)
 
     # Check Buttplug server connection
@@ -814,7 +808,8 @@ async def connection_status(interaction: discord.Interaction):
     if device_manager.devices:
         device_statuses = []
         for device in device_manager.get_all_devices():
-            status = "🟢 Connected" if device.device and device.device in device_manager.client.devices.values() else "🔴 Disconnected"
+            connected_ids = {str(d.index) for d in device_manager.client.devices.values()}
+            status = "🟢 Connected" if device.device and device.device_id in connected_ids else "🔴 Disconnected"
             device_statuses.append(f"{device.device_name} ({device.device_id}): {status}")
         embed.add_field(name="Devices", value="\n".join(device_statuses), inline=False)
     else:
@@ -873,7 +868,8 @@ async def rescan(interaction: discord.Interaction):
         if device_manager.devices:
             device_list = []
             for device in device_manager.get_all_devices():
-                status = "🟢 Connected" if device.device and device.device in device_manager.client.devices.values() else "🔴 Disconnected"
+                connected_ids = {str(d.index) for d in device_manager.client.devices.values()}
+                status = "🟢 Connected" if device.device and device.device_id in connected_ids else "🔴 Disconnected"
                 device_list.append(f"{status} {device.device_name} (ID: {device.device_id})")
             embed.add_field(
                 name="Current Toys",
